@@ -1,0 +1,260 @@
+---
+title: "cmipexplore"
+format: html
+---
+
+```{r}
+Sys.setenv(GDAL_DISABLE_READDIR_ON_OPEN = "EMPTY_DIR")
+Sys.setenv(CPL_VSIL_CURL_ALLOWED_EXTENSIONS = ".tif")
+Sys.setenv(VSI_CACHE = "TRUE")
+Sys.setenv(GDAL_HTTP_VERSION = "2")
+Sys.setenv(GDAL_HTTP_MULTIPLEX = "YES")
+```
+
+
+
+```{r}
+library(terra)
+library(tidyterra)
+library(ggplot2)
+library(rnaturalearth)
+library(sf)
+library(ggthemes)
+library(furrr)
+library(tidyverse)
+library(jsonlite)
+plan(multisession, workers = 8)
+```
+Projected URL: sfcWind_month_ensemble-median_ssp585_209805.tif
+               sfcWind_month_ensemble-median_ssp245_209411.tif
+Historical URL: "/vsicurl/https://nex-gddp-cmip6-cog.s3.us-west-2.amazonaws.com/monthly/CMIP6_ensemble_median/sfcWind/sfcWind_month_ensemble-median_historical_195001.tif"
+
+Script to read in all tif files
+
+
+```{r}
+years <- seq(1950, 2099)
+months <- sprintf("%02d", seq(1,12))
+variables <- c("hurs","huss","pr","rlds","rsds","sfcWind", "tas","tasmax","tasmin")
+times <- c("historical", "ssp585", "ssp245")
+combos <- expand.grid(year = years, variable = variables, time = times)
+
+midwest_states <- c(
+  "Minnesota", "Wisconsin", "Iowa", "Illinois", "Indiana", "Michigan",
+  "Ohio", "Missouri", "Kansas", "Nebraska", "North Dakota", "South Dakota"
+)
+states <- ne_states(country = "United States of America", returnclass = "sf")
+midwest_sf <- states[states$name %in% midwest_states, ]
+midwest_sf_slim <- midwest_sf %>% select(name, geometry)
+st_write(midwest_sf_slim, "website_data/midwest_states.geojson", delete_dsn = TRUE)
+
+url <- "/vsicurl/https://nex-gddp-cmip6-cog.s3.us-west-2.amazonaws.com/monthly/CMIP6_ensemble_median/pr/pr_month_ensemble-median_ssp585_202001.tif"
+r <- rast(url)
+r_crop <- crop(r, midwest_vect)
+r_mask <- mask(r_crop, midwest_vect)
+summary(values(r_mask))
+
+midwest_vect <- vect(midwest_sf)
+
+clean_combos <- combos%>%
+  filter(!(year < 2015 & time %in% c("ssp585", "ssp245")),
+         !(year >2014 & time == "historical"),
+         !(year == 2096 & variable == "tas"),
+         !(year == 2093 & variable == "tasmin" & time == "ssp585"))%>%
+  arrange(year)%>%
+  arrange(variable)%>%
+  arrange(time)
+
+process_year <- function(var, scenario, yr, months, midwest_vect){
+  
+  midwest_vect <- unwrap(midwest_vect)
+  out_file <- str_c("../../cmip6/data/", var, "/", var, "_", scenario, "_", yr, ".tif")
+  if (file.exists(out_file)) return(out_file)
+  
+  rast_year <- vector("list", length = 12)
+  
+  for (mo in months){
+    url <- str_c("/vsicurl/https://nex-gddp-cmip6-cog.s3.us-west-2.amazonaws.com/monthly/CMIP6_ensemble_median/", var, "/", var, "_month_ensemble-median_", scenario, "_", yr, mo, ".tif")
+    r <- rast(url)
+    r_crop <- crop(r, midwest_vect)
+    r_mask <- mask(r_crop, midwest_vect)
+    
+    # sec conversion removed — pr values from this product are already monthly mm totals
+    
+    rast_year[[as.numeric(mo)]] <- r_mask
+  }
+  
+  year_stack <- rast(rast_year)
+  agg_fun <- if (var == "pr") sum else mean
+  annual <- app(year_stack, fun = agg_fun, na.rm = TRUE)
+  writeRaster(annual, out_file, overwrite = TRUE)
+  out_file
+}
+
+midwest_wrapped <- wrap(midwest_vect)
+results <- future_pmap(
+  clean_combos%>%filter(variable == "pr"),
+  function(variable, time, year) {
+    process_year(
+      var = variable,
+      scenario = time,
+      yr = year,
+      months = months,
+      midwest_vect = midwest_wrapped
+    )
+  },
+  .options = furrr_options(packages = "terra"),
+  .progress = TRUE
+)
+length(list.files("data/tasmin"))*9*16/1000
+
+```
+
+Getting one lat/long file
+
+```{r}
+r <- rast("data/sfcWind/sfcWind_ssp585_2099.tif")
+df <- as.data.frame(r, xy=TRUE)
+names(df) <- c("lon", "lat", "value")
+lat_long <- df%>%select(-value)
+write_json(lat_long, "data/lat_long.json")
+```
+
+Converting GeoTiff to JSON
+
+```{r}
+
+convert_file <- function(tif_path, var_name, out_path){
+  r <- rast(tif_path)
+  df <- as.data.frame(r, xy = TRUE)
+  names(df) <- c("lon", "lat", "value")
+  if (var_name %in% c("tasmin", "tasmax", "tas")){
+    df <- df%>%
+      mutate(value = (value - 273.15)*9/5 + 32)
+  }
+  else if (var_name == "sfcWind"){
+    df <- df%>%
+      mutate(value = value*2.237)
+  }
+  else if (var_name == "pr"){
+    df <- df%>%
+      mutate(value = value/25.4)
+  }
+  write_json(df%>%select(value), out_path)
+}
+
+tif_files <- list.files("data", pattern = "\\.tif$", recursive = TRUE, full.names = TRUE)
+
+for (file in tif_files){
+  var_name <- str_extract(file, "((?<=/).*)(?=/)")
+  new_path <- str_c("data/website_data/", str_remove(file, "data/")%>%str_remove(".tif"), ".json")
+  convert_file(file, var_name, new_path)
+}
+
+dat <- fromJSON("data/website_data/tasmin/tasmin_ssp585_2099.json")
+```
+
+
+
+```{r}
+tif_files <- list.files("../../cmip6/data/pr", pattern = "\\.tif$", recursive = TRUE, full.names = TRUE)
+
+# ---------------------------------------------------------------
+# 1. Build ONE fixed spatial mask + cell order, from geometry alone —
+#    not from any file's data — so every file is read out identically.
+# ---------------------------------------------------------------
+
+template <- rast(tif_files[1])                       # any file works: same grid throughout
+midwest_mask_r <- rasterize(midwest_vect, template)   # purely geometric, same every year
+in_midwest <- !is.na(values(midwest_mask_r)[, 1])     # fixed-length logical vector
+
+xy_all <- xyFromCell(template, 1:ncell(template))
+lon_lat <- as.data.frame(xy_all[in_midwest, ])
+names(lon_lat) <- c("lon", "lat")
+
+# dir.create("data/website_data", recursive = TRUE, showWarnings = FALSE)
+# write_json(lon_lat, "data/website_data/lat_long.json", digits = 4)
+
+# ---------------------------------------------------------------
+# 2. Parse variable/scenario/year from filenames, and verify every
+#    file actually shares the template's grid before trusting position.
+# ---------------------------------------------------------------
+
+parse_tif_meta <- function(path) {
+  file_noext <- str_remove(basename(path), "\\.tif$")
+  parts <- str_split(file_noext, "_")[[1]]
+  n <- length(parts)
+  tibble(
+    variable = str_c(parts[1:(n - 2)], collapse = "_"),
+    scenario = parts[n - 1],
+    year     = as.numeric(parts[n]),
+    path     = path
+  )
+}
+
+meta <- bind_rows(lapply(tif_files, parse_tif_meta))
+
+geometry_ok <- sapply(meta$path, function(p) compareGeom(rast(p), template, stopOnError = FALSE))
+if (!all(geometry_ok)) {
+  stop("Geometry mismatch in: ", paste(meta$path[!geometry_ok], collapse = ", "))
+}
+
+# ---------------------------------------------------------------
+# 3. Unit conversions (same as your version, kept as-is)
+# ---------------------------------------------------------------
+
+convert_units <- function(vals, var_name) {
+  if (var_name %in% c("tasmin", "tasmax", "tas")) {
+    (vals - 273.15) * 9/5 + 32          # K -> F
+  } else if (var_name == "sfcWind") {
+    vals * 2.237                        # m/s -> mph
+  } else if (var_name == "pr") {
+    vals / 25.4                         # mm -> inches
+  } else {
+    vals
+  }
+}
+
+# ---------------------------------------------------------------
+# 4. Build the 27 aggregated files: one per variable+scenario,
+#    each { years: [...], values: [[...], [...], ...] }.
+#    Every year is pulled through the SAME in_midwest mask, so
+#    position i is always the same grid cell, everywhere.
+# ---------------------------------------------------------------
+
+grouped_list <- meta %>% arrange(variable, scenario, year) %>% group_split(variable, scenario)
+
+for (g in grouped_list) {
+  var_name <- g$variable[1]
+  scenario_name <- g$scenario[1]
+
+  values_by_year <- lapply(g$path, function(p) {
+    r <- rast(p)
+    vals <- values(r)[, 1][in_midwest]     # same length/order every year, guaranteed
+    vals <- convert_units(vals, var_name)
+    round(vals, 3)
+  })
+
+  out <- list(years = g$year, values = values_by_year)
+  out_path <- str_c("website_data/", var_name, "_", scenario_name, ".json")
+  write_json(out, out_path, auto_unbox = TRUE, na = "null")
+}
+```
+
+
+
+Example plot
+
+```{r}
+ggplot() +
+  geom_spatraster(data = r_mask) +
+  geom_sf(data = midwest_sf, fill = NA, color = "black", linewidth = 0.3) +
+  scale_fill_viridis_c(name = "Wind speed\n(m/s)", na.value = "transparent") +
+  labs(
+    title = "Near-surface wind speed — January 1950",
+    subtitle = "NEX-GDDP-CMIP6 ensemble median, masked to Midwest states",
+    x = NULL, y = NULL
+  ) +
+  theme_map()
+```
+
